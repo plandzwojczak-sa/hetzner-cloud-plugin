@@ -15,6 +15,7 @@
  */
 package cloud.dnation.jenkins.plugins.hetzner;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.Uninterruptibles;
 import hudson.model.Computer;
@@ -26,12 +27,37 @@ import lombok.extern.slf4j.Slf4j;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.IntConsumer;
+import java.util.function.LongSupplier;
 
 @Slf4j
 @RequiredArgsConstructor
 class NodeCallable implements Callable<Node> {
+    /**
+     * Cumulative poll instants 2, 6, 15, 30, 45, 60, ... - a superset of the 45, 60, 75, ... this
+     * plugin polled on before, so a server is never noticed later than it used to be.
+     */
+    @VisibleForTesting
+    static final int[] POLL_SCHEDULE = {2, 4, 9};
+    @VisibleForTesting
+    static final int MAX_POLL_INTERVAL = 15;
+    @VisibleForTesting
+    static final int SETTLE_AFTER_RUNNING = 2;
+
     private final HetznerServerAgent agent;
     private final HetznerCloud cloud;
+
+    @VisibleForTesting
+    static boolean awaitRunning(WaitStrategy waitStrategy, BooleanSupplier aliveCheck) {
+        while (!waitStrategy.isDeadLineOver()) {
+            waitStrategy.waitNext();
+            if (aliveCheck.getAsBoolean()) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     @Override
     public Node call() throws Exception {
@@ -42,21 +68,14 @@ class NodeCallable implements Callable<Node> {
         final HetznerServerInfo serverInfo = cloud.getResourceManager().createServer(agent);
         agent.setServerInstance(serverInfo);
         final String serverName = serverInfo.getServerDetail().getName();
-        boolean running = false;
         final int bootDeadline = agent.getTemplate().getBootDeadline();
-        //wait for status == "running", but at most 15 minutes
-        final WaitStrategy waitStrategy = new WaitStrategy(bootDeadline, 45, 15);
-        while (!waitStrategy.isDeadLineOver()) {
-            waitStrategy.waitNext();
-            if (agent.isAlive()) {
-                log.info("Server '{}' is now running, waiting 10 seconds before proceeding", serverName);
-                Uninterruptibles.sleepUninterruptibly(10, TimeUnit.SECONDS);
-                running = true;
-                break;
-            }
-        }
-        Preconditions.checkState(running, "Server '%s' didn't start after 15 minutes, giving up",
-                serverName);
+        //wait for status == "running", but at most bootDeadline minutes
+        final WaitStrategy waitStrategy = new WaitStrategy(bootDeadline, POLL_SCHEDULE, MAX_POLL_INTERVAL);
+        Preconditions.checkState(awaitRunning(waitStrategy, agent::isAlive),
+                "Server '%s' didn't start after %s minutes, giving up", serverName, bootDeadline);
+        log.info("Server '{}' is now running, waiting {} seconds before proceeding", serverName,
+                SETTLE_AFTER_RUNNING);
+        Uninterruptibles.sleepUninterruptibly(SETTLE_AFTER_RUNNING, TimeUnit.SECONDS);
         Jenkins.get().addNode(agent);
         computer = agent.toComputer();
         int retry = 5;
@@ -83,31 +102,38 @@ class NodeCallable implements Callable<Node> {
         return agent;
     }
 
-    private static final class WaitStrategy {
-        private final int firstInterval;
-        private final int subsequentIntervals;
+    @VisibleForTesting
+    static final class WaitStrategy {
+        private final int[] schedule;
+        private final int maxInterval;
         private final long deadlineNanos;
-        private boolean first = true;
+        private final LongSupplier clock;
+        private final IntConsumer sleeper;
+        private int polls;
 
-        private WaitStrategy(int deadlineMinutes, int firstInterval, int subsequentIntervals) {
-            deadlineNanos = System.nanoTime() + deadlineMinutes * 60L * 1_000_000_000L;
-            this.firstInterval = firstInterval;
-            this.subsequentIntervals = subsequentIntervals;
+        WaitStrategy(int deadlineMinutes, int[] schedule, int maxInterval) {
+            this(deadlineMinutes, schedule, maxInterval, System::nanoTime,
+                    seconds -> Uninterruptibles.sleepUninterruptibly(seconds, TimeUnit.SECONDS));
+        }
+
+        @VisibleForTesting
+        WaitStrategy(int deadlineMinutes, int[] schedule, int maxInterval, LongSupplier clock,
+                     IntConsumer sleeper) {
+            Preconditions.checkArgument(schedule.length > 0, "empty poll schedule");
+            Preconditions.checkArgument(maxInterval > 0, "maxInterval must be positive");
+            this.clock = clock;
+            this.sleeper = sleeper;
+            this.deadlineNanos = clock.getAsLong() + deadlineMinutes * 60L * 1_000_000_000L;
+            this.schedule = schedule.clone();
+            this.maxInterval = maxInterval;
         }
 
         boolean isDeadLineOver() {
-            return System.nanoTime() > deadlineNanos;
+            return clock.getAsLong() > deadlineNanos;
         }
 
         void waitNext() {
-            final int waitSeconds;
-            if (first) {
-                first = false;
-                waitSeconds = firstInterval;
-            } else {
-                waitSeconds = subsequentIntervals;
-            }
-            Uninterruptibles.sleepUninterruptibly(waitSeconds, TimeUnit.SECONDS);
+            sleeper.accept(polls < schedule.length ? schedule[polls++] : maxInterval);
         }
     }
 }
